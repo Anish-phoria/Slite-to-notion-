@@ -252,22 +252,43 @@ class MainController:
                         if current_node.get("is_db_row"):
                             refresh_ui(custom_text=f"Injecting Row: {title[:15]}...")
                             
-                            row_props = {}
-                            schema = current_node.get("parent_schema") or []
+                            # --- FIXED: Map to "Title" instead of "Name" ---
+                            row_props = {
+                                "Title": {"title": [{"text": {"content": title}}]}
+                            }
+                            
+                            schema = current_node.get("parent_schema") or ["Column 1"]
                             attrs = current_node.get("attributes") or []
                             
                             for idx, col_name in enumerate(schema):
                                 safe_name = col_name if col_name.strip() else f"Column {idx + 1}"
                                 val = attrs[idx] if idx < len(attrs) else ""
+                                col_lower = safe_name.lower()
                                 
-                                if idx == 0:
-                                    row_props[safe_name] = {"title": [{"text": {"content": val or title}}]}
+                                # 1. URL Logic
+                                if "video" in col_lower or "link" in col_lower or "url" in col_lower:
+                                    row_props[safe_name] = {"url": val} if isinstance(val, str) and val.startswith("http") else {"url": None}
+                                
+                                # 2. MULTI-SELECT Logic (Robust Parser)
+                                elif "tag" in col_lower or "status" in col_lower or "category" in col_lower:
+                                    tags = []
+                                    if isinstance(val, str) and val.strip():
+                                        # Splits by comma and creates the Notion dictionary format
+                                        tags = [{"name": t.strip()[:100]} for t in val.split(",") if t.strip()] 
+                                    elif isinstance(val, list):
+                                        tags = [{"name": str(t).strip()[:100]} for t in val if str(t).strip()]
+                                    row_props[safe_name] = {"multi_select": tags}
+                                
+                                # 3. CHECKBOX Logic
+                                elif "done" in col_lower or "check" in col_lower or "complete" in col_lower:
+                                    # Safely check if the Slite string implies a checkmark
+                                    is_checked = str(val).lower().strip() in ["true", "yes", "checked", "1", "x"]
+                                    row_props[safe_name] = {"checkbox": is_checked}
+                                
+                                # 4. Default TEXT Logic
                                 else:
-                                    col_lower = safe_name.lower()
-                                    if "video" in col_lower or "link" in col_lower or "url" in col_lower:
-                                        row_props[safe_name] = {"url": val} if val.startswith("http") else {"url": None}
-                                    else:
-                                        row_props[safe_name] = {"rich_text": [{"text": {"content": val}}]} if val else {"rich_text": []}
+                                    str_val = str(val) if val is not None else ""
+                                    row_props[safe_name] = {"rich_text": [{"text": {"content": str_val[:2000]}}]} if str_val else {"rich_text": []}
 
                             success, result = NotionAPI.create_page(
                                 self.notion_api_key, current_notion_parent, title, notion_blocks[:100], 

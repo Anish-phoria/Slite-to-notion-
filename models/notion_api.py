@@ -134,40 +134,32 @@ class NotionAPI:
     def create_database(api_key, parent_page_id, db_title, slite_columns):
         """
         Creates an inline database at the bottom of a parent page.
-        Automatically maps Slite column headers to Notion property schemas.
         """
         url = "https://api.notion.com/v1/databases"
         headers = NotionAPI._get_headers(api_key)
         
-        # --- SCHEMA MAPPING HEURISTIC ---
-        properties = {}
+        # --- FIXED: Use "Title" to match your Slite screenshot perfectly ---
+        properties = {
+            "Title": {"title": {}} 
+        }
         
         for index, col_name in enumerate(slite_columns):
             safe_name = col_name if col_name.strip() else f"Column {index + 1}"
+            col_lower = safe_name.lower()
             
-            # First column is always the Notion Title
-            if index == 0:
-                properties[safe_name] = {"title": {}}
+            # Smart Routing for Column Types
+            if "video" in col_lower or "link" in col_lower or "url" in col_lower:
+                properties[safe_name] = {"url": {}}
+            elif "tag" in col_lower or "status" in col_lower or "category" in col_lower:
+                properties[safe_name] = {"multi_select": {}}
+            elif "done" in col_lower or "check" in col_lower or "complete" in col_lower:
+                properties[safe_name] = {"checkbox": {}}
             else:
-                col_lower = safe_name.lower()
-                # Map obvious links to URL properties
-                if "video" in col_lower or "link" in col_lower or "url" in col_lower:
-                    properties[safe_name] = {"url": {}}
-                # Default everything else to rich_text to prevent API crashes
-                else:
-                    properties[safe_name] = {"rich_text": {}}
+                properties[safe_name] = {"rich_text": {}}
                     
         payload = {
-            "parent": {
-                "type": "page_id",
-                "page_id": parent_page_id
-            },
-            "title": [
-                {
-                    "type": "text",
-                    "text": {"content": db_title}
-                }
-            ],
+            "parent": {"type": "page_id", "page_id": parent_page_id},
+            "title": [{"type": "text", "text": {"content": db_title}}],
             "properties": properties,
             "is_inline": True
         }
@@ -178,6 +170,5 @@ class NotionAPI:
                 return True, response.json()["id"]
             else:
                 return False, f"API Error {response.status_code}: {response.text}"
-                
         except Exception as e:
             return False, str(e)
