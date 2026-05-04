@@ -126,43 +126,65 @@ class MainController:
             self.main_window.append_log("🔴 Error: Document ID is empty.", "error")
             return
 
-        # --- NEW: Save the keys and Doc ID to local memory so they persist ---
         self.main_window.save_config(self.slite_api_key, self.notion_api_key, doc_id)
 
         self.main_window.terminal_box.configure(state="normal")
         self.main_window.terminal_box.delete("0.0", "end")
         self.main_window.terminal_box.configure(state="disabled")
-
         self.main_window.append_log(f"--- STARTING MIGRATION ---", "info")
 
         def extraction_process():
             try:
+                import time
                 from pathlib import Path
                 
                 # ==========================================
-                # PHASE 1: WORKSPACE INDEXING
+                # PHASE 1: WORKSPACE INDEXING & CACHING
                 # ==========================================
-                self.main_window.append_log("Phase 1: Indexing Workspace Structure...", "info")
+                self.main_window.append_log("Phase 1: Indexing Workspace Structure & Schemas...", "info")
                 self.main_window.update_progress(0.02, "Phase 1: Indexing...")
                 
                 total_discovered = 0
                 
-                def build_tree_map(current_id):
+                def build_tree_map(current_id, is_db_row=False, parent_schema=None):
                     nonlocal total_discovered
+                    
+                    # We fetch the full note once and cache it to prevent the "Double-Fetch" bottleneck
                     note_info = SliteAPI.get_note(self.slite_api_key, current_id)
+                    
                     title = note_info.get("title", "Untitled")
+                    icon_shape = note_info.get("iconShape")
+                    is_database = (icon_shape == "#collection_table")
                     
-                    node = {"id": current_id, "title": title, "children": []}
+                    node = {
+                        "id": current_id, 
+                        "title": title, 
+                        "content": note_info.get("content", ""),
+                        "is_database": is_database,
+                        "is_db_row": is_db_row,
+                        "attributes": note_info.get("attributes", []),
+                        "parent_schema": parent_schema,
+                        "db_schema": None,
+                        "children": []
+                    }
+                    
                     total_discovered += 1
-                    
                     visual_progress = min(0.10, total_discovered * 0.005)
                     self.main_window.update_progress(visual_progress, f"Indexing: Found {total_discovered} docs...")
                     
-                    # ONLY fetch children if the user wants sub-docs included!
                     if include_subdocs:
                         kids = SliteAPI.get_children(self.slite_api_key, current_id)
+                        
+                        # If this is a database, peek at the first child to get the column schema
+                        db_schema = None
+                        if is_database and kids:
+                            db_schema = SliteAPI.get_database_schema(self.slite_api_key, kids[0]["id"])
+                            node["db_schema"] = db_schema
+                            self.main_window.append_log(f"  ↳ Discovered Database: {title}", "warn")
+                            
                         for k in kids:
-                            node["children"].append(build_tree_map(k["id"]))
+                            # If parent is a database, the children are flagged as rows
+                            node["children"].append(build_tree_map(k["id"], is_db_row=is_database, parent_schema=db_schema))
                             
                     return node
 
@@ -175,77 +197,129 @@ class MainController:
                 self.main_window.append_log("Phase 2: Starting Content Migration...", "info")
                 
                 docs_processed = 0
-                work_root = Path(local_path) if save_local and local_path else Path("./Slite_Export")
+                docs_processed_local = 0
+                docs_processed_notion = 0
                 
+                active_pipelines = (1 if save_local else 0) + (1 if push_to_notion else 0)
+                if active_pipelines == 0: active_pipelines = 1 
+                
+                work_root = Path(local_path) if save_local and local_path else Path("./Slite_Export")
                 stack = [(root_node, work_root, target_space_id)]
                 
                 while stack:
                     current_node, parent_dir, current_notion_parent = stack.pop()
+                    title = current_node['title']
+                    md_content = current_node["content"]
                     
-                    main_progress = 0.10 + (docs_processed / total_discovered) * 0.90
+                    # --- DYNAMIC PROGRESS CALCULATOR ---
+                    def refresh_ui(notion_chunk_progress=0.0, local_chunk_progress=0.0, custom_text=None):
+                        l_val = ((docs_processed_local + local_chunk_progress) / total_discovered) if save_local else 0.0
+                        n_val = ((docs_processed_notion + notion_chunk_progress) / total_discovered) if push_to_notion else 0.0
+                        combo_val = (l_val + n_val) / active_pipelines if (save_local or push_to_notion) else (docs_processed / total_discovered)
+                        main_val = 0.10 + (combo_val * 0.90)
+                        text = custom_text or f"Migrating ({docs_processed+1}/{total_discovered}): {title[:15]}..."
+                        self.main_window.update_progress(main_val, text, local_val=l_val, notion_val=n_val)
+
+                    refresh_ui(custom_text=f"Reading: {title[:15]}...")
+                    self.main_window.append_log(f"\nProcessing: {title}", "info")
                     
-                    self.main_window.update_progress(
-                        main_progress, 
-                        f"Migrating ({docs_processed+1}/{total_discovered}): {current_node['title'][:15]}...",
-                        local_val=main_progress if save_local else 0.0,
-                        notion_val=main_progress if push_to_notion else 0.0
-                    )
-                    
-                    self.main_window.append_log(f"\nProcessing: {current_node['title']}", "info")
-                    
-                    note_data = SliteAPI.get_note(self.slite_api_key, current_node["id"])
-                    md_content = note_data.get("content") or ""
-                    
-                    # --- LOCAL HTML LOGIC ---
-                    this_dir = parent_dir / HTMLEngine.sanitize_dir(current_node["title"])
+                    # --- 1. LOCAL HTML LOGIC ---
+                    this_dir = parent_dir / HTMLEngine.sanitize_dir(title)
                     if save_local:
+                        refresh_ui(custom_text=f"Saving Local: {title[:15]}...")
                         i = 2
                         base = this_dir
                         while this_dir.exists():
                             this_dir = base.parent / f"{base.name} ({i})"
                             i += 1
-                        HTMLEngine.generate_html(current_node["title"], md_content, this_dir)
-                        self.main_window.append_log(f"  ↳ Saved local HTML", "success")
+                            
+                        def local_progress_ping(current_item, total_items):
+                            ratio = current_item / max(total_items, 1) 
+                            refresh_ui(local_chunk_progress=ratio, custom_text=f"Downloading assets ({current_item}/{total_items})...")
 
-                    # --- NOTION PUSH LOGIC ---
-                    new_notion_page_id = current_notion_parent
+                        HTMLEngine.generate_html(title, md_content, this_dir, progress_callback=local_progress_ping)
+                        self.main_window.append_log(f"  ↳ Saved local HTML", "success")
+                        docs_processed_local += 1 
+
+                    # --- 2. NOTION PUSH LOGIC ---
+                    new_notion_parent_for_children = current_notion_parent
+                    
                     if push_to_notion:
                         notion_blocks = NotionTranslator.parse_slite_to_notion_blocks(md_content)
                         total_blocks = len(notion_blocks)
                         
-                        success, result = NotionAPI.create_page(self.notion_api_key, current_notion_parent, current_node["title"], notion_blocks)
-                        
-                        if success:
-                            new_notion_page_id = result
-                            self.main_window.append_log(f"  ↳ Page created in Notion ({min(total_blocks, 100)} blocks)", "success")
+                        # PATH A: It's a Database Row
+                        if current_node.get("is_db_row"):
+                            refresh_ui(custom_text=f"Injecting Row: {title[:15]}...")
                             
-                            if total_blocks > 100:
-                                self.main_window.append_log(f"  ↳ Large document detected. Appending {total_blocks - 100} remaining blocks...", "warn")
+                            row_props = {}
+                            schema = current_node.get("parent_schema") or []
+                            attrs = current_node.get("attributes") or []
+                            
+                            for idx, col_name in enumerate(schema):
+                                safe_name = col_name if col_name.strip() else f"Column {idx + 1}"
+                                val = attrs[idx] if idx < len(attrs) else ""
                                 
-                                for i in range(100, total_blocks, 100):
-                                    chunk = notion_blocks[i:i+100]
-                                    chunk_ratio = min(1.0, (i + len(chunk)) / total_blocks)
-                                    self.main_window.update_progress(
-                                        main_progress, 
-                                        f"Uploading blocks {i} to {i+len(chunk)}...",
-                                        notion_val=chunk_ratio
-                                    )
-                                    
-                                    app_success, app_msg = NotionAPI.append_blocks(self.notion_api_key, new_notion_page_id, chunk)
-                                    if app_success:
-                                        self.main_window.append_log(f"    ↳ Appended blocks {i} to {i+len(chunk)}", "success")
+                                if idx == 0:
+                                    row_props[safe_name] = {"title": [{"text": {"content": val or title}}]}
+                                else:
+                                    col_lower = safe_name.lower()
+                                    if "video" in col_lower or "link" in col_lower or "url" in col_lower:
+                                        row_props[safe_name] = {"url": val} if val.startswith("http") else {"url": None}
                                     else:
-                                        self.main_window.append_log(f"    ↳ Append Failed: {app_msg}", "error")
-                                        break
-                                    
-                                    time.sleep(0.4) 
+                                        row_props[safe_name] = {"rich_text": [{"text": {"content": val}}]} if val else {"rich_text": []}
+
+                            success, result = NotionAPI.create_page(
+                                self.notion_api_key, current_notion_parent, title, notion_blocks[:100], 
+                                is_database_row=True, row_properties=row_props
+                            )
+                            if success:
+                                new_notion_parent_for_children = result
+                                self.main_window.append_log(f"  ↳ Row mapped & created", "success")
+                            else:
+                                self.main_window.append_log(f"  ↳ Row Creation Failed: {result}", "error")
+
+                        # PATH B: It's a Standard Page (or Database Parent)
                         else:
-                            self.main_window.append_log(f"  ↳ Notion Push Failed: {result}", "error")
+                            refresh_ui(custom_text=f"Creating Page: {title[:15]}...")
+                            success, result = NotionAPI.create_page(self.notion_api_key, current_notion_parent, title, notion_blocks[:100])
+                            
+                            if success:
+                                new_notion_parent_for_children = result
+                                self.main_window.append_log(f"  ↳ Page created in Notion", "success")
+                                
+                                # If this page was flagged as a Database Parent, we inject the database block now
+                                if current_node.get("is_database") and current_node.get("db_schema"):
+                                    self.main_window.append_log(f"  ↳ Building Inline Database...", "warn")
+                                    db_success, db_result = NotionAPI.create_database(
+                                        self.notion_api_key, result, f"{title} Database", current_node["db_schema"]
+                                    )
+                                    if db_success:
+                                        new_notion_parent_for_children = db_result # Force children into the database!
+                                        self.main_window.append_log(f"  ↳ Inline Database created successfully", "success")
+                                    else:
+                                        self.main_window.append_log(f"  ↳ Inline DB Failed: {db_result}", "error")
+                            else:
+                                self.main_window.append_log(f"  ↳ Notion Push Failed: {result}", "error")
+
+                        # Handle remaining blocks (for both pages and rows)
+                        if success and total_blocks > 100:
+                            for i in range(100, total_blocks, 100):
+                                chunk = notion_blocks[i:i+100]
+                                chunk_ratio = min(1.0, (i + len(chunk)) / total_blocks)
+                                refresh_ui(notion_chunk_progress=chunk_ratio, custom_text=f"Uploading blocks {i} to {i+len(chunk)}...")
+                                
+                                # We append to 'result', because we want blocks on the page, not inside the database shell
+                                NotionAPI.append_blocks(self.notion_api_key, result, chunk)
+                                time.sleep(0.4) 
+
+                        docs_processed_notion += 1
+                        refresh_ui()
 
                     docs_processed += 1
                     
                     for child in reversed(current_node["children"]):
-                        stack.append((child, this_dir, new_notion_page_id))
+                        stack.append((child, this_dir, new_notion_parent_for_children))
 
                 self.main_window.append_log(f"\n✅ Migration Complete! Successfully transferred {total_discovered} documents.", "success")
                 self.main_window.update_progress(1.0, f"Transfer Complete ({total_discovered} docs)", local_val=1.0 if save_local else 0.0, notion_val=1.0 if push_to_notion else 0.0)

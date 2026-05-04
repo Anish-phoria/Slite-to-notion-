@@ -109,30 +109,16 @@ class SliteAPI:
     def build_collection_tree(api_key, root_note_id, include_children=True):
         """
         Builds a dict that groups notes by their immediate parent’s title.
-
-        Returns:
-        {
-            "collections": {
-                "Engineering": [
-                    {"id": "...", "title": "...", "parentNoteId": "...", ...},
-                    ...
-                ],
-                ...
-            },
-            "orphans": [ ... ]   # notes whose parent is the root or unknown
-        }
         """
         all_notes = SliteAPI.deep_index(api_key, root_note_id, include_children)
         collections = {}
         orphans = []
-        # Get root title for orphan detection
         root_meta = SliteAPI.get_note_metadata(api_key, root_note_id)
         root_title = root_meta.get("title", "")
 
         for note in all_notes:
             parent_id = note.get("parentNoteId")
             if parent_id and parent_id != root_note_id:
-                # Resolve parent title (could be cached, but fine for small workspaces)
                 parent_meta = SliteAPI.get_note_metadata(api_key, parent_id)
                 parent_name = parent_meta.get("title", "Unknown Collection")
             else:
@@ -144,3 +130,14 @@ class SliteAPI:
                 orphans.append(note)
 
         return {"collections": collections, "orphans": orphans}
+
+    # ───────────────────── NEW SCHEMA PEEK METHOD ─────────────────────
+
+    @staticmethod
+    def get_database_schema(api_key, first_child_id):
+        """
+        Peeks at the first child of a suspected database to extract column headers.
+        Returns the list of column names, or None if no columns exist.
+        """
+        data = SliteAPI.get_note(api_key, first_child_id)
+        return data.get("columns")
