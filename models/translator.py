@@ -236,24 +236,51 @@ class NotionTranslator:
         m = self.MEDIA_RE.match(line)
         if not m:
             return None
+            
         caption_text = m.group(1)
         media_url = m.group(2)
-        url_ext = media_url.split('?')[0].lower()   # strip query params
+        
+        # We must check BOTH the URL and the Caption for the file extension, 
+        # because Slite hides the extension in the caption for API-token links!
+        url_ext = media_url.split('?')[0].lower()   
+        caption_lower = caption_text.lower() 
 
-        if url_ext.endswith(('.mp4', '.mov', '.webm', '.mkv')):
+        # 1. VIDEO
+        video_exts = ('.mp4', '.mov', '.webm', '.mkv')
+        if url_ext.endswith(video_exts) or any(caption_lower.endswith(ext) for ext in video_exts):
             block = {"object": "block", "type": "video",
                      "video": {"type": "external", "external": {"url": media_url}}}
             if caption_text.strip():
                 block["video"]["caption"] = self.parse_inline_markdown(caption_text.strip())
             return block
 
-        if url_ext.endswith(('.mp3', '.wav', '.ogg', '.m4a')):
+        # 2. AUDIO
+        audio_exts = ('.mp3', '.wav', '.ogg', '.m4a')
+        if url_ext.endswith(audio_exts) or any(caption_lower.endswith(ext) for ext in audio_exts):
             block = {"object": "block", "type": "audio",
                      "audio": {"type": "external", "external": {"url": media_url}}}
             if caption_text.strip():
                 block["audio"]["caption"] = self.parse_inline_markdown(caption_text.strip())
             return block
 
+        # 3. PDF
+        if url_ext.endswith('.pdf') or caption_lower.endswith('.pdf'):
+            block = {"object": "block", "type": "pdf",
+                     "pdf": {"type": "external", "external": {"url": media_url}}}
+            if caption_text.strip():
+                block["pdf"]["caption"] = self.parse_inline_markdown(caption_text.strip())
+            return block
+
+        # 4. GENERIC FILES (Word, Excel, Zips, CSVs)
+        file_exts = ('.zip', '.csv', '.docx', '.doc', '.xlsx', '.xls', '.ppt', '.pptx', '.txt')
+        if url_ext.endswith(file_exts) or any(caption_lower.endswith(ext) for ext in file_exts):
+            block = {"object": "block", "type": "file",
+                     "file": {"type": "external", "external": {"url": media_url}, "name": caption_text.strip()}}
+            if caption_text.strip():
+                block["file"]["caption"] = self.parse_inline_markdown(caption_text.strip())
+            return block
+
+        # 5. IMAGES (Or fallback if it looks like an image markdown)
         if line.startswith('!['):
             block = {"object": "block", "type": "image",
                      "image": {"type": "external", "external": {"url": media_url}}}
@@ -261,15 +288,7 @@ class NotionTranslator:
                 block["image"]["caption"] = self.parse_inline_markdown(caption_text.strip())
             return block
 
-        # Fallback: if it looks like a media link but no extension matched,
-        # treat as image (original behaviour)
-        if line.startswith('!['):
-            block = {"object": "block", "type": "image",
-                     "image": {"type": "external", "external": {"url": media_url}}}
-            if caption_text.strip():
-                block["image"]["caption"] = self.parse_inline_markdown(caption_text.strip())
-            return block
-
+        # If it's none of the above, return None so it renders as a standard text link
         return None
 
     def _parse_quote_or_callout(self, line: str):
