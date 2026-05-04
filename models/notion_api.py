@@ -132,22 +132,19 @@ class NotionAPI:
 
     @staticmethod
     def create_database(api_key, parent_page_id, db_title, slite_columns):
-        """
-        Creates an inline database at the bottom of a parent page.
-        """
+        """Creates an inline database at the bottom of a parent page."""
         url = "https://api.notion.com/v1/databases"
         headers = NotionAPI._get_headers(api_key)
         
-        # --- FIXED: Use "Title" to match your Slite screenshot perfectly ---
+        # --- Back to the clean default ---
         properties = {
-            "Title": {"title": {}} 
+            "Name": {"title": {}} 
         }
         
         for index, col_name in enumerate(slite_columns):
             safe_name = col_name if col_name.strip() else f"Column {index + 1}"
             col_lower = safe_name.lower()
             
-            # Smart Routing for Column Types
             if "video" in col_lower or "link" in col_lower or "url" in col_lower:
                 properties[safe_name] = {"url": {}}
             elif "tag" in col_lower or "status" in col_lower or "category" in col_lower:

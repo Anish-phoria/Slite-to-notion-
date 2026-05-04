@@ -242,50 +242,43 @@ class MainController:
                         docs_processed_local += 1 
 
                     # --- 2. NOTION PUSH LOGIC ---
-                    new_notion_parent_for_children = current_notion_parent
-                    
+                    new_notion_parent_for_children = current_notion_parent                    
                     if push_to_notion:
                         notion_blocks = NotionTranslator.parse_slite_to_notion_blocks(md_content)
                         total_blocks = len(notion_blocks)
                         
-                        # PATH A: It's a Database Row
+                        # 1. CREATE THE NODE (As a Row OR a Standard Page)
                         if current_node.get("is_db_row"):
                             refresh_ui(custom_text=f"Injecting Row: {title[:15]}...")
                             
-                            # --- FIXED: Map to "Title" instead of "Name" ---
-                            row_props = {
-                                "Title": {"title": [{"text": {"content": title}}]}
-                            }
+                            # --- MAGIC FIX 1: Target the system ID "title" directly ---
+                            row_props = {"title": {"title": [{"text": {"content": title}}]}}
                             
                             schema = current_node.get("parent_schema") or ["Column 1"]
                             attrs = current_node.get("attributes") or []
                             
                             for idx, col_name in enumerate(schema):
                                 safe_name = col_name if col_name.strip() else f"Column {idx + 1}"
+                                # Prevent Slite from overwriting the primary Notion key
+                                if safe_name.lower() in ["name", "title"]: 
+                                    safe_name = f"{safe_name} (Slite Data)"
+                                    
                                 val = attrs[idx] if idx < len(attrs) else ""
                                 col_lower = safe_name.lower()
                                 
-                                # 1. URL Logic
                                 if "video" in col_lower or "link" in col_lower or "url" in col_lower:
                                     row_props[safe_name] = {"url": val} if isinstance(val, str) and val.startswith("http") else {"url": None}
-                                
-                                # 2. MULTI-SELECT Logic (Robust Parser)
                                 elif "tag" in col_lower or "status" in col_lower or "category" in col_lower:
                                     tags = []
                                     if isinstance(val, str) and val.strip():
-                                        # Splits by comma and creates the Notion dictionary format
-                                        tags = [{"name": t.strip()[:100]} for t in val.split(",") if t.strip()] 
+                                        # --- MAGIC FIX 2: The corrected Python array parser! ---
+                                        tags = [{"name": t.strip()[:100]} for t in val.split(",") if t.strip()]
                                     elif isinstance(val, list):
                                         tags = [{"name": str(t).strip()[:100]} for t in val if str(t).strip()]
                                     row_props[safe_name] = {"multi_select": tags}
-                                
-                                # 3. CHECKBOX Logic
                                 elif "done" in col_lower or "check" in col_lower or "complete" in col_lower:
-                                    # Safely check if the Slite string implies a checkmark
                                     is_checked = str(val).lower().strip() in ["true", "yes", "checked", "1", "x"]
                                     row_props[safe_name] = {"checkbox": is_checked}
-                                
-                                # 4. Default TEXT Logic
                                 else:
                                     str_val = str(val) if val is not None else ""
                                     row_props[safe_name] = {"rich_text": [{"text": {"content": str_val[:2000]}}]} if str_val else {"rich_text": []}
@@ -294,45 +287,51 @@ class MainController:
                                 self.notion_api_key, current_notion_parent, title, notion_blocks[:100], 
                                 is_database_row=True, row_properties=row_props
                             )
-                            if success:
-                                new_notion_parent_for_children = result
-                                self.main_window.append_log(f"  ↳ Row mapped & created", "success")
-                            else:
-                                self.main_window.append_log(f"  ↳ Row Creation Failed: {result}", "error")
-
-                        # PATH B: It's a Standard Page (or Database Parent)
+                            
+                            # --- MAGIC FIX 3: Prevent Cascading Schema Errors ---
+                            if not success:
+                                # If this row fails to build, tell its children to just become normal pages 
+                                # so they don't try to inject into the wrong database!
+                                for child in current_node["children"]:
+                                    child["is_db_row"] = False
                         else:
                             refresh_ui(custom_text=f"Creating Page: {title[:15]}...")
                             success, result = NotionAPI.create_page(self.notion_api_key, current_notion_parent, title, notion_blocks[:100])
                             
-                            if success:
-                                new_notion_parent_for_children = result
-                                self.main_window.append_log(f"  ↳ Page created in Notion", "success")
-                                
-                                # If this page was flagged as a Database Parent, we inject the database block now
-                                if current_node.get("is_database") and current_node.get("db_schema"):
-                                    self.main_window.append_log(f"  ↳ Building Inline Database...", "warn")
-                                    db_success, db_result = NotionAPI.create_database(
-                                        self.notion_api_key, result, f"{title} Database", current_node["db_schema"]
-                                    )
-                                    if db_success:
-                                        new_notion_parent_for_children = db_result # Force children into the database!
-                                        self.main_window.append_log(f"  ↳ Inline Database created successfully", "success")
-                                    else:
-                                        self.main_window.append_log(f"  ↳ Inline DB Failed: {db_result}", "error")
-                            else:
-                                self.main_window.append_log(f"  ↳ Notion Push Failed: {result}", "error")
+                        # 2. POST-CREATION ROUTING (Database Shells & Blocks)
+                        if success:
+                            new_notion_parent_for_children = result
+                            self.main_window.append_log(f"  ↳ Node created in Notion", "success")
+                            
+                            # --- THE NESTED DATABASE FIX ---
+                            # Whether it's a page or a row, if it's flagged as a DB, build the inline table inside it!
+                            if current_node.get("is_database"):
+                                self.main_window.append_log(f"  ↳ Building Inline Database...", "warn")
+                                schema_to_use = current_node.get("db_schema")
+                                if not schema_to_use: schema_to_use = ["Data"] 
+                                    
+                                db_success, db_result = NotionAPI.create_database(
+                                    self.notion_api_key, result, f"{title} Database", schema_to_use
+                                )
+                                if db_success:
+                                    new_notion_parent_for_children = db_result 
+                                    self.main_window.append_log(f"  ↳ Inline Database created successfully", "success")
+                                else:
+                                    self.main_window.append_log(f"  ↳ Inline DB Failed: {db_result}", "error")
+                                    # Safety Switch: Prevent children from crashing if the DB shell fails
+                                    for child in current_node["children"]:
+                                        child["is_db_row"] = False
 
-                        # Handle remaining blocks (for both pages and rows)
-                        if success and total_blocks > 100:
-                            for i in range(100, total_blocks, 100):
-                                chunk = notion_blocks[i:i+100]
-                                chunk_ratio = min(1.0, (i + len(chunk)) / total_blocks)
-                                refresh_ui(notion_chunk_progress=chunk_ratio, custom_text=f"Uploading blocks {i} to {i+len(chunk)}...")
-                                
-                                # We append to 'result', because we want blocks on the page, not inside the database shell
-                                NotionAPI.append_blocks(self.notion_api_key, result, chunk)
-                                time.sleep(0.4) 
+                            # Handle remaining blocks (for both pages and rows)
+                            if total_blocks > 100:
+                                for i in range(100, total_blocks, 100):
+                                    chunk = notion_blocks[i:i+100]
+                                    chunk_ratio = min(1.0, (i + len(chunk)) / total_blocks)
+                                    refresh_ui(notion_chunk_progress=chunk_ratio, custom_text=f"Uploading blocks {i} to {i+len(chunk)}...")
+                                    NotionAPI.append_blocks(self.notion_api_key, result, chunk)
+                                    time.sleep(0.4) 
+                        else:
+                            self.main_window.append_log(f"  ↳ Notion Push Failed: {result}", "error")
 
                         docs_processed_notion += 1
                         refresh_ui()
