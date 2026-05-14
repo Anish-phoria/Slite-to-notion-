@@ -1,5 +1,9 @@
 import time
 import requests
+import urllib.request       
+import base64
+import json
+from datetime import datetime
 
 class SliteAPI:
     BASE_URL = "https://api.slite.com/v1"
@@ -141,3 +145,73 @@ class SliteAPI:
         """
         data = SliteAPI.get_note(api_key, first_child_id)
         return data.get("columns")
+    
+    @staticmethod
+    def download_secure_attachment(api_key, url, save_path):
+        """
+        Surgical downloader with verbose logging. 
+        Forces 'phoria' domain and prevents header leakage to Google.
+        """
+        user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        print(f"[SECURITY DEBUG] Sending Key: {api_key}...")
+        # --- STEP 1: Domain Normalization ---
+        # The curl test proved phoria.slite.com works while slite.com fails.
+        if "slite.com" in url and "phoria.slite.com" not in url:
+            url = url.replace("slite.com", "phoria.slite.com")
+
+        slite_headers = {
+            "User-Agent": user_agent,
+            "x-slite-api-key": api_key.strip(),
+            "Accept": "*/*"
+        }
+        
+        try:
+            print("\n" + "="*60)
+            print("SLITE SECURE DOWNLOAD START")
+            print(f"Target URL: {url[:120]}...")
+            
+            # Step A: Hit Slite but do NOT follow redirect automatically
+            resp = requests.get(url, headers=slite_headers, allow_redirects=False, timeout=30)
+            
+            
+            # Step B: Check for the hand-off to Google Cloud
+            if resp.status_code in [301, 302, 303, 307, 308]:
+                google_url = resp.headers.get('Location')
+                print(f"DEBUG: Found Redirect to Google Storage")
+                print(f"Google URL: {google_url[:100]}...")
+                
+                # Step C: Naked request to Google using urllib (no Slite headers allowed!)
+                print("DEBUG: Initiating clean-header download from Google...")
+                req = urllib.request.Request(google_url)
+                req.add_header("User-Agent", user_agent)
+                
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    print(f"Google Response Status: {response.status}")
+                    with open(save_path, 'wb') as out_file:
+                        out_file.write(response.read())
+                
+                print("✓ SUCCESS: File saved to temporary path.")
+                print("="*60 + "\n")
+                print(f"Slite Response: {resp.status_code}")
+                print("\n" + "-"*30)
+                print(f"FINAL OUTGOING URL: {url}") # THIS IS THE CRITICAL LINE
+                print("-"*30 + "\n")
+                return True, save_path
+            
+            else:
+                print(f"✖ FAIL: Slite rejected request. Status: {resp.status_code}")
+                if resp.status_code == 403:
+                    print(f"Slite Response: {resp.status_code}")
+                    print("\n" + "-"*30)
+                    print(f"FINAL OUTGOING URL: {url}") # THIS IS THE CRITICAL LINE
+                    print("-"*30 + "\n")
+                    print("ERROR: Check if the API key has permission for this Note ID.")
+                print("="*60 + "\n")
+                return False, f"Status {resp.status_code}"
+            
+        except Exception as e:
+            print(f"⚠ EXCEPTION: {str(e)}")
+            print("="*60 + "\n")
+            return False, str(e)
+        
+    

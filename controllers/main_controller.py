@@ -1,9 +1,14 @@
 import threading
 import time
+import os
+import tempfile
+import re  # Required for the Auto-Refresh token logic
+from pathlib import Path
 from tkinter import filedialog
+
+# Model Imports
 from models.slite_api import SliteAPI
 from models.notion_api import NotionAPI
-from pathlib import Path
 from models.html_engine import HTMLEngine
 from models.translator import NotionTranslator
 
@@ -22,23 +27,18 @@ class MainController:
         # 2. Attach the window
         self.main_window = window
         
-        # 3. NOW pull the saved keys from the UI's memory into the controller!
+        # 3. Pull saved keys from UI memory
         self.slite_api_key = self.main_window.saved_config.get("slite_key", "")
         self.notion_api_key = self.main_window.saved_config.get("notion_key", "")
         
-        # --- NEW: Auto-fetch Notion spaces on boot if we have a key! ---
         if self.notion_api_key:
             self.main_window.append_log("Found saved Notion API key. Auto-fetching spaces...", "info")
-            
-            # We run this in a quick background thread so it doesn't freeze 
-            # your UI while it talks to the Notion servers during startup.
             threading.Thread(target=self.fetch_notion_spaces, daemon=True).start()
 
     def set_preferences_window(self, window):
         self.prefs_window = window
 
     def select_local_folder(self):
-        # Opens standard macOS folder picker
         folder_selected = filedialog.askdirectory(title="Select Backup Folder")
         if folder_selected:
             self.selected_local_path = folder_selected
@@ -55,7 +55,7 @@ class MainController:
         def run_test():
             success, message = SliteAPI.test_connection(api_key)
             if success:
-                self.slite_api_key = api_key # Save to memory for later
+                self.slite_api_key = api_key 
                 self.prefs_window.update_slite_status("success", message)
             else:
                 self.slite_api_key = None
@@ -74,7 +74,7 @@ class MainController:
         def run_test():
             success = NotionAPI.test_connection(api_key)
             if success:
-                self.notion_api_key = api_key # Save to memory for later
+                self.notion_api_key = api_key 
                 self.prefs_window.update_notion_status("success", "Connected")
             else:
                 self.notion_api_key = None
@@ -87,13 +87,12 @@ class MainController:
             self.main_window.update_space_dropdown(["⚠️ Configure Notion API First"])
             return
 
-        # Show loading state in the UI dropdown
         self.main_window.update_space_dropdown(["Fetching spaces..."])
 
         def run_fetch():
             success, result = NotionAPI.get_available_spaces(self.notion_api_key)
             if success:
-                self.notion_spaces_map = result # Save the {Title: ID} dictionary
+                self.notion_spaces_map = result 
                 space_names = list(result.keys())
                 
                 if space_names:
@@ -110,7 +109,6 @@ class MainController:
         target_space_name = self.main_window.space_dropdown.get()
         target_space_id = self.notion_spaces_map.get(target_space_name, None)
         
-        # Capture the toggle states
         push_to_notion = self.main_window.push_switch.get() == 1
         include_subdocs = self.main_window.subdoc_switch.get() == 1
         save_local = self.main_window.local_switch.get() == 1
@@ -134,10 +132,7 @@ class MainController:
         self.main_window.append_log(f"--- STARTING MIGRATION ---", "info")
 
         def extraction_process():
-            try:
-                import time
-                from pathlib import Path
-                
+            try:       
                 # ==========================================
                 # PHASE 1: WORKSPACE INDEXING & CACHING
                 # ==========================================
@@ -148,8 +143,6 @@ class MainController:
                 
                 def build_tree_map(current_id, is_db_row=False, parent_schema=None):
                     nonlocal total_discovered
-                    
-                    # We fetch the full note once and cache it to prevent the "Double-Fetch" bottleneck
                     note_info = SliteAPI.get_note(self.slite_api_key, current_id)
                     
                     title = note_info.get("title", "Untitled")
@@ -174,8 +167,6 @@ class MainController:
                     
                     if include_subdocs:
                         kids = SliteAPI.get_children(self.slite_api_key, current_id)
-                        
-                        # If this is a database, peek at the first child to get the column schema
                         db_schema = None
                         if is_database and kids:
                             db_schema = SliteAPI.get_database_schema(self.slite_api_key, kids[0]["id"])
@@ -183,7 +174,6 @@ class MainController:
                             self.main_window.append_log(f"  ↳ Discovered Database: {title}", "warn")
                             
                         for k in kids:
-                            # If parent is a database, the children are flagged as rows
                             node["children"].append(build_tree_map(k["id"], is_db_row=is_database, parent_schema=db_schema))
                             
                     return node
@@ -211,6 +201,7 @@ class MainController:
                     title = current_node['title']
                     md_content = current_node["content"]
                     
+                
                     # --- DYNAMIC PROGRESS CALCULATOR ---
                     def refresh_ui(notion_chunk_progress=0.0, local_chunk_progress=0.0, custom_text=None):
                         l_val = ((docs_processed_local + local_chunk_progress) / total_discovered) if save_local else 0.0
@@ -237,7 +228,7 @@ class MainController:
                             ratio = current_item / max(total_items, 1) 
                             refresh_ui(local_chunk_progress=ratio, custom_text=f"Downloading assets ({current_item}/{total_items})...")
 
-                        HTMLEngine.generate_html(title, md_content, this_dir, progress_callback=local_progress_ping)
+                        HTMLEngine.generate_html(title, md_content, this_dir, progress_callback=local_progress_ping, api_key=self.slite_api_key)
                         self.main_window.append_log(f"  ↳ Saved local HTML", "success")
                         docs_processed_local += 1 
 
@@ -245,21 +236,61 @@ class MainController:
                     new_notion_parent_for_children = current_notion_parent                    
                     if push_to_notion:
                         notion_blocks = NotionTranslator.parse_slite_to_notion_blocks(md_content)
+                        
+                        media_types = ["image", "video", "audio", "pdf", "file"]
+                        for block in notion_blocks:
+                            b_type = block.get("type")
+                            if b_type in media_types:
+                                media_obj = block.get(b_type, {})
+                                if media_obj.get("type") == "external":
+                                    url = media_obj["external"].get("url", "")
+                                    
+                                    if "api/token=" in url or "slite.com" in url:
+                                        refresh_ui(custom_text=f"Migrating Media: {b_type}...")
+                                        self.main_window.append_log(f"  ↳ Downloading secure {b_type}...", "info")
+                                        
+                                        ext = ".bin"
+                                        if b_type == "pdf": ext = ".pdf"
+                                        elif b_type == "image": ext = ".jpg"
+                                        elif b_type == "video": ext = ".mp4"
+                                        elif b_type == "audio": ext = ".mp3"
+                                        elif b_type == "file": ext = ".zip" 
+                                        
+                                        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                                            temp_path = tmp.name
+                                            
+                                        dl_success, dl_result = SliteAPI.download_secure_attachment(self.slite_api_key, url, temp_path)
+                                        
+                                        if dl_success:
+                                            self.main_window.append_log(f"  ↳ Pushing {b_type} to Notion...", "info")
+                                            up_success, up_result = NotionAPI.upload_file(self.notion_api_key, temp_path)
+                                            
+                                            if up_success:
+                                                block[b_type] = {
+                                                    "type": "file_upload",
+                                                    "file_upload": {"id": up_result}
+                                                }
+                                                if "caption" in media_obj:
+                                                    block[b_type]["caption"] = media_obj["caption"]
+                                                self.main_window.append_log(f"  ↳ Successfully hosted {b_type}", "success")
+                                            else:
+                                                self.main_window.append_log(f"  ↳ Notion Upload Failed: {up_result}", "warn")
+                                        else:
+                                            self.main_window.append_log(f"  ↳ Slite Download Failed: {dl_result}", "warn")
+                                            
+                                        if os.path.exists(temp_path):
+                                            os.remove(temp_path)
+                        
                         total_blocks = len(notion_blocks)
                         
-                        # 1. CREATE THE NODE (As a Row OR a Standard Page)
                         if current_node.get("is_db_row"):
                             refresh_ui(custom_text=f"Injecting Row: {title[:15]}...")
-                            
-                            # --- MAGIC FIX 1: Target the system ID "title" directly ---
                             row_props = {"title": {"title": [{"text": {"content": title}}]}}
-                            
                             schema = current_node.get("parent_schema") or ["Column 1"]
                             attrs = current_node.get("attributes") or []
                             
                             for idx, col_name in enumerate(schema):
                                 safe_name = col_name if col_name.strip() else f"Column {idx + 1}"
-                                # Prevent Slite from overwriting the primary Notion key
                                 if safe_name.lower() in ["name", "title"]: 
                                     safe_name = f"{safe_name} (Slite Data)"
                                     
@@ -269,12 +300,7 @@ class MainController:
                                 if "video" in col_lower or "link" in col_lower or "url" in col_lower:
                                     row_props[safe_name] = {"url": val} if isinstance(val, str) and val.startswith("http") else {"url": None}
                                 elif "tag" in col_lower or "status" in col_lower or "category" in col_lower:
-                                    tags = []
-                                    if isinstance(val, str) and val.strip():
-                                        # --- MAGIC FIX 2: The corrected Python array parser! ---
-                                        tags = [{"name": t.strip()[:100]} for t in val.split(",") if t.strip()]
-                                    elif isinstance(val, list):
-                                        tags = [{"name": str(t).strip()[:100]} for t in val if str(t).strip()]
+                                    tags = [{"name": t.strip()[:100]} for t in str(val).split(",") if t.strip()]
                                     row_props[safe_name] = {"multi_select": tags}
                                 elif "done" in col_lower or "check" in col_lower or "complete" in col_lower:
                                     is_checked = str(val).lower().strip() in ["true", "yes", "checked", "1", "x"]
@@ -283,51 +309,35 @@ class MainController:
                                     str_val = str(val) if val is not None else ""
                                     row_props[safe_name] = {"rich_text": [{"text": {"content": str_val[:2000]}}]} if str_val else {"rich_text": []}
 
-                            success, result = NotionAPI.create_page(
-                                self.notion_api_key, current_notion_parent, title, notion_blocks[:100], 
-                                is_database_row=True, row_properties=row_props
-                            )
+                            success, result = NotionAPI.create_page(self.notion_api_key, current_notion_parent, title, notion_blocks[:100], is_database_row=True, row_properties=row_props)
                             
-                            # --- MAGIC FIX 3: Prevent Cascading Schema Errors ---
                             if not success:
-                                # If this row fails to build, tell its children to just become normal pages 
-                                # so they don't try to inject into the wrong database!
                                 for child in current_node["children"]:
                                     child["is_db_row"] = False
                         else:
                             refresh_ui(custom_text=f"Creating Page: {title[:15]}...")
                             success, result = NotionAPI.create_page(self.notion_api_key, current_notion_parent, title, notion_blocks[:100])
                             
-                        # 2. POST-CREATION ROUTING (Database Shells & Blocks)
                         if success:
                             new_notion_parent_for_children = result
                             self.main_window.append_log(f"  ↳ Node created in Notion", "success")
                             
-                            # --- THE NESTED DATABASE FIX ---
-                            # Whether it's a page or a row, if it's flagged as a DB, build the inline table inside it!
                             if current_node.get("is_database"):
                                 self.main_window.append_log(f"  ↳ Building Inline Database...", "warn")
-                                schema_to_use = current_node.get("db_schema")
-                                if not schema_to_use: schema_to_use = ["Data"] 
-                                    
-                                db_success, db_result = NotionAPI.create_database(
-                                    self.notion_api_key, result, f"{title} Database", schema_to_use
-                                )
+                                schema_to_use = current_node.get("db_schema") or ["Data"] 
+                                db_success, db_result = NotionAPI.create_database(self.notion_api_key, result, f"{title} Database", schema_to_use)
                                 if db_success:
                                     new_notion_parent_for_children = db_result 
                                     self.main_window.append_log(f"  ↳ Inline Database created successfully", "success")
                                 else:
                                     self.main_window.append_log(f"  ↳ Inline DB Failed: {db_result}", "error")
-                                    # Safety Switch: Prevent children from crashing if the DB shell fails
                                     for child in current_node["children"]:
                                         child["is_db_row"] = False
 
-                            # Handle remaining blocks (for both pages and rows)
                             if total_blocks > 100:
                                 for i in range(100, total_blocks, 100):
                                     chunk = notion_blocks[i:i+100]
-                                    chunk_ratio = min(1.0, (i + len(chunk)) / total_blocks)
-                                    refresh_ui(notion_chunk_progress=chunk_ratio, custom_text=f"Uploading blocks {i} to {i+len(chunk)}...")
+                                    refresh_ui(notion_chunk_progress=min(1.0, (i + len(chunk)) / total_blocks), custom_text=f"Uploading blocks...")
                                     NotionAPI.append_blocks(self.notion_api_key, result, chunk)
                                     time.sleep(0.4) 
                         else:
@@ -337,7 +347,6 @@ class MainController:
                         refresh_ui()
 
                     docs_processed += 1
-                    
                     for child in reversed(current_node["children"]):
                         stack.append((child, this_dir, new_notion_parent_for_children))
 
